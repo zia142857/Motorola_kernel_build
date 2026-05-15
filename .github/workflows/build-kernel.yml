@@ -1,4 +1,4 @@
-name: Stable KernelSU Next 4.19 (Moto Edge S)
+name: Stable KernelSU Next 4.19 (NO CRASH CI)
 
 on:
   workflow_dispatch:
@@ -11,23 +11,46 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Install deps
+      # =========================
+      # 依赖安装
+      # =========================
+      - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y git bc bison flex libssl-dev make \
           python3 gcc-aarch64-linux-gnu zip curl
 
-      # ======================
-      # Kernel Source
-      # ======================
-      - name: Clone kernel source
+      # =========================
+      # SAFE KERNEL CLONE (关键)
+      # =========================
+      - name: Clone kernel source (SAFE MODE)
         run: |
-          git clone ${{ secrets.KERNEL_SOURCE }} kernel
+          if [ -n "${{ secrets.KERNEL_SOURCE }}" ]; then
+            echo "Using secret kernel source"
+            git clone ${{ secrets.KERNEL_SOURCE }} kernel
+          else
+            echo "Secret empty → fallback to official Motorola source"
+            git clone https://github.com/MotorolaMobility/kernel-msm-nio.git kernel
+          fi
 
-      # ======================
-      # KernelSU Next (STABLE)
-      # ======================
-      - name: Clone KernelSU Next legacy
+      # =========================
+      # Kernel sanity check（防炸关键）
+      # =========================
+      - name: Validate kernel source
+        run: |
+          echo "Checking kernel structure..."
+
+          test -d kernel/arch || (echo "❌ invalid kernel: missing arch" && exit 1)
+          test -d kernel/drivers || (echo "❌ invalid kernel: missing drivers" && exit 1)
+
+          ls kernel/arch/arm64/configs || (echo "❌ missing defconfig" && exit 1)
+
+          echo "✅ kernel source OK"
+
+      # =========================
+      # KernelSU Next（锁版本稳定）
+      # =========================
+      - name: Clone KernelSU Next (stable legacy)
         run: |
           git clone -b legacy-4.19 \
           https://github.com/KernelSU-Next/KernelSU-Next.git kernelsu
@@ -36,26 +59,35 @@ jobs:
         run: |
           cd kernelsu
 
-          # ⚠️ 关键：关闭高风险hook
+          # 防止4.19炸
           export KSU_KERNEL_4_19=1
           export KSU_MODULE_ONLY=1
 
           bash scripts/integrate.sh ../kernel
 
-      # ======================
-      # Fix 4.19 config safety
-      # ======================
-      - name: Patch kernel config for stability
+      # =========================
+      # Kernel config safety patch
+      # =========================
+      - name: Patch config (stability mode)
         run: |
           cd kernel
 
-          echo "CONFIG_KSU=y" >> arch/arm64/configs/nio_defconfig
-          echo "CONFIG_KSU_MODULE=y" >> arch/arm64/configs/nio_defconfig
-          echo "# CONFIG_KSU_KPROBES is not set" >> arch/arm64/configs/nio_defconfig
+          DEFCONFIG=$(ls arch/arm64/configs | grep nio || true)
 
-      # ======================
+          if [ -z "$DEFCONFIG" ]; then
+            echo "❌ defconfig not found"
+            exit 1
+          fi
+
+          echo "Using defconfig: $DEFCONFIG"
+
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
+          echo "CONFIG_KSU_MODULE=y" >> arch/arm64/configs/$DEFCONFIG
+          echo "# CONFIG_KSU_KPROBES is not set" >> arch/arm64/configs/$DEFCONFIG
+
+      # =========================
       # Build
-      # ======================
+      # =========================
       - name: Build kernel
         run: |
           cd kernel
@@ -65,9 +97,9 @@ jobs:
           make O=out nio_defconfig
           make -j$(nproc) O=out
 
-      # ======================
+      # =========================
       # Package
-      # ======================
+      # =========================
       - name: Package AnyKernel3
         run: |
           git clone https://github.com/osm0sis/AnyKernel3.git ak3
@@ -75,10 +107,13 @@ jobs:
           cp kernel/out/arch/arm64/boot/Image.gz-dtb ak3/
 
           cd ak3
-          zip -r KernelSU_Stable_4.19.zip ./*
+          zip -r KernelSU_Stable.zip ./*
 
-      - name: Upload
+      # =========================
+      # Upload
+      # =========================
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: KernelSU-Stable-4.19
-          path: ak3/KernelSU_Stable_4.19.zip
+          path: ak3/KernelSU_Stable.zip
