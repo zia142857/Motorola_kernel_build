@@ -34,7 +34,7 @@ jobs:
       - name: KernelSU-Next
         run: |
           cd kernel-source
-          curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/refs/heads/master/kernel/setup.sh" | bash -s main
+          curl -LSs "https://raw.githubusercontent.com/backslashxx/KernelSU/refs/heads/master/kernel/setup.sh" | bash -s master
           cd ..
 
       - name: Build kernel
