@@ -1,88 +1,157 @@
-name: Build Kernel (nio, Perfect-Reproduction)
+name: Build moto edge s (Lineage OS 23.2 A16)
 
 on:
   workflow_dispatch:
 
 jobs:
   build-kernel:
+    name: moto edge s (Lineage OS 23.2 A16)
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout WorkSpace
+      - name: ⏰ Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Build Environment
+      - name: ⌛️ Install dependencies
         run: |
           sudo apt-get update
-          # 100% 确保安装了标准的官方编译工具及稳定的系统级设备树编译器 device-tree-compiler
-          sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev libelf-dev flex bison texinfo libselinux1-dev unzip wget curl git libgmp-dev libmpfr-dev libmpc-dev device-tree-compiler
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex \
+            git libssl-dev libelf-dev lz4 python3 \
+            zip device-tree-compiler xz-utils
 
-      - name: Pull Official Android NDK r29 (For Clang 21)
+      - name: 📥 Clone kernel source
         run: |
-          cd $GITHUB_WORKSPACE
-          echo "=====> Downloading Android NDK r29..."
-          wget -q https://dl.google.com/android/repository/android-ndk-r29-linux.zip
-          echo "=====> Extracting NDK..."
-          unzip -q android-ndk-r29-linux.zip
-          rm android-ndk-r29-linux.zip
+          git clone --depth=1 \
+            -b lineage-23.2 \
+            https://github.com/LineageOS/android_kernel_motorola_sm8250.git \
+            device_kernel
 
-      - name: Pull Kernel Source (lineage-23.2)
+      - name: 🔧 Download Clang r574158
         run: |
-          cd $GITHUB_WORKSPACE
-          git clone --depth=1 https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 kernel-source
+          mkdir -p clang
+          curl -L "https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r574158-14475230/clang-r574158.tar.gz" | tar -xz -C clang
 
-      - name: Inject Configuration & Fix Source Error
+      - name: 🏗️ Generate defconfig
         run: |
-          cd $GITHUB_WORKSPACE/kernel-source
-          mkdir -p out
-          
-          # 1. 抓取完美的原始 config
-          curl -Lo out/.config https://raw.githubusercontent.com/zia142857/Motorola_kernel_build/master/config
-          
-          # 2. 烫平显示驱动源码的未定义调用报错
-          sed -i 's/return dcs_cmds->mipi_dsi_dcs_write_playlist(cmds, num);/return 0;/g' drivers/video/fbdev/msm/mdss_dsi.h
-          
-          # 3. 全局关闭“警告视作错误”的拦截器
-          sed -i 's/CONFIG_CC_WERROR=y/CONFIG_CC_WERROR=n/g' out/.config
+          export PATH=$(pwd)/clang/bin:$PATH
+          cd device_kernel
 
-      - name: Setup Ultimate DTC Wrapper & Compile
+          make O=out ARCH=arm64 \
+            CC=clang HOSTCC=gcc HOSTCXX=g++ \
+            LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
+            vendor/kona-perf_defconfig
+
+          ./scripts/kconfig/merge_config.sh -O out/ -m out/.config \
+            arch/arm64/configs/vendor/ext_config/moto-kona.config \
+            arch/arm64/configs/vendor/ext_config/nio-default.config
+
+          scripts/config --file out/.config \
+            --disable CONFIG_MODULE_SIG \
+            --disable CONFIG_MODULE_SIG_FORCE \
+            --disable CONFIG_MODULE_SIG_ALL \
+            --disable CONFIG_MODVERSIONS \
+            --enable CONFIG_CFI_PERMISSIVE \
+            --set-val CONFIG_PANIC_TIMEOUT -1
+
+          make O=out ARCH=arm64 \
+            CC=clang HOSTCC=gcc HOSTCXX=g++ \
+            LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
+            olddefconfig
+
+      - name: 🔍 Verify config
         run: |
-          # 【终极补丁：环境变量绝对优先劫持】
-          # 我们在 GitHub 的临时工作区创建一个覆盖路径，专门放一个软链接假装是内核自己编译出来的 dtc
-          # 这样无论内核编译树用何种绝对路径或相对路径去调用 dtc，都会被我们系统的稳健 dtc 完美替代，彻底杜绝段错误！
-          mkdir -p $GITHUB_WORKSPACE/fake-bin
-          ln -sf /usr/bin/dtc $GITHUB_WORKSPACE/fake-bin/dtc
-          
-          cd $GITHUB_WORKSPACE/kernel-source
-          
-          # 核心：将假 bin 目录排在 PATH 的最前面，随后是 Clang 21 的编译器路径
-          export PATH="$GITHUB_WORKSPACE/fake-bin:$GITHUB_WORKSPACE/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          export KBUILD_BUILD_USER="adn_builder"
-          export KBUILD_BUILD_HOST="GitHub-Actions"
-          
-          # 自适应補完配置
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
-          
-          # 全速编译（此时设备树全盘被劫持到系统 dtc，绝对不会崩，线程拉满加速编译）
-          make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 KCFLAGS="-Wno-error" Image dtbs
+          cd device_kernel
+          echo "=== LTO ===" && grep "CONFIG_LTO" out/.config
+          echo "=== CFI ===" && grep "CONFIG_CFI" out/.config
+          echo "=== MODULE_SIG ===" && grep "CONFIG_MODULE_SIG" out/.config
+          echo "=== MODVERSIONS ===" && grep "CONFIG_MODVERSIONS" out/.config
 
-      - name: Physically Stitch Image-dtb & Packaging
+      - name: 🚀 Build kernel
         run: |
-          cd $GITHUB_WORKSPACE
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/LICENSE AnyKernel3/README.md
-          
-          # 拼接 Image 和全套厂商 dtb
-          cat kernel-source/out/arch/arm64/boot/Image kernel-source/out/arch/arm64/boot/dts/vendor/qcom/*.dtb > kernel-source/out/arch/arm64/boot/Image-dtb
-          cp kernel-source/out/arch/arm64/boot/Image-dtb AnyKernel3/kernel
-          
-          if [ -f kernel-source/out/arch/arm64/boot/dtbo.img ]; then
-            cp kernel-source/out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
-          fi
+          export PATH=$(pwd)/clang/bin:$PATH
+          cd device_kernel
 
-      - name: Upload Finished Kernel Zip to Artifact
+          make -j$(nproc --all) O=out ARCH=arm64 \
+            CC=clang HOSTCC=gcc HOSTCXX=g++ \
+            LD=ld.lld LLVM=1 LLVM_IAS=1 \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
+            KCFLAGS="-Wno-unknown-warning-option -Wno-pointer-sign -Wno-unused-but-set-variable -Wno-gnu-variable-sized-type-not-at-end -Wno-tautological-constant-out-of-range-compare" \
+            2>&1 | tee build.log
+
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: 🌲 Collect DTBs
+        run: |
+          cd device_kernel
+          DTB_DIR="out/arch/arm64/boot/dts/vendor/qcom"
+
+          # 列出所有 DTB 文件
+          echo "=== Available DTBs ==="
+          ls $DTB_DIR/*.dtb | head -20
+
+          # 找到 nio 相关 DTB
+          echo "=== nio DTBs ==="
+          ls $DTB_DIR/*nio*.dtb 2>/dev/null || echo "No nio-specific DTB found"
+          ls $DTB_DIR/*kona-moto*.dtb 2>/dev/null || echo "No kona-moto DTB found"
+
+          # 合并所有 kona-moto DTB（和官方构建方式一致）
+          cat $DTB_DIR/kona-moto*.dtb > ../combined-dtb.img
+          ls -lh ../combined-dtb.img
+          echo "DTB_READY=true" >> $GITHUB_ENV
+
+      - name: 📦 Package boot.img
+        run: |
+          # 下载官方 boot.img
+          curl -L "https://mirrors.ocf.berkeley.edu/lineageos/full/nio/20260615/boot.img" \
+            -o boot_source.img
+
+          # 下载 magiskboot
+          curl -L "https://github.com/topjohnwu/Magisk/releases/download/v28.0/Magisk-v28.0.apk" \
+            -o Magisk.apk
+          unzip -p Magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
+          chmod +x magiskboot
+
+          # 解包并替换内核
+          ./magiskboot unpack boot_source.img
+          cp device_kernel/out/arch/arm64/boot/Image kernel
+          ./magiskboot repack boot_source.img new-boot.img
+
+          ls -lh new-boot.img
+
+      - name: 📦 Package vendor_boot.img
+        run: |
+          # 下载官方 vendor_boot.img
+          curl -L "https://mirrors.ocf.berkeley.edu/lineageos/full/nio/20260615/vendor_boot.img" \
+            -o vendor_boot_source.img
+
+          mkdir vendor_boot_unpack
+          cp vendor_boot_source.img vendor_boot_unpack/
+          cd vendor_boot_unpack
+
+          # 解包 vendor_boot
+          ../magiskboot unpack vendor_boot_source.img
+
+          # 替换 DTB
+          cp ../combined-dtb.img dtb
+
+          # 重新打包
+          ../magiskboot repack vendor_boot_source.img new-vendor_boot.img
+
+          cp new-vendor_boot.img ../
+          cd ..
+          ls -lh new-vendor_boot.img
+
+      - name: ✏️ Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: Moto-EdgeS-Nio-Kernel-Perfect
-          path: AnyKernel3/*
+          name: nio-lineage23.2-images
+          path: |
+            new-boot.img
+            new-vendor_boot.img
+            device_kernel/build.log
