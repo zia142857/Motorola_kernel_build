@@ -13,8 +13,9 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev libelf-dev bistrip flex bison textinfo libselinux1-dev unzip wget curl
-          
+          # 【精准修复】去掉了错误的 bistrip 和 textinfo，换成了标准的 texinfo 以及完整的内核编译环境
+          sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev libelf-dev flex bison texinfo libselinux1-dev unzip wget curl git libgmp-dev libmpfr-dev libmpc-dev
+
       - name: Pull Official Android NDK r29 (For Clang 21)
         run: |
           cd $GITHUB_WORKSPACE
@@ -23,7 +24,7 @@ jobs:
           echo "=====> Extracting NDK..."
           unzip -q android-ndk-r29-linux.zip
           rm android-ndk-r29-linux.zip
-          
+
       - name: Pull Kernel Source (lineage-23.2)
         run: |
           cd $GITHUB_WORKSPACE
@@ -35,7 +36,7 @@ jobs:
           cd $GITHUB_WORKSPACE/kernel-source
           mkdir -p out
           
-          # 【精准修复】不克隆仓库，直接用 curl 从你的 master 分支拉取单一的 config 文件并写入 out/.config
+          # 通过 Raw 链接直接拉取你的单个 config 文件并写入 out/.config
           curl -Lo out/.config https://raw.githubusercontent.com/zia142857/Motorola_kernel_build/master/config
           
           # 导入 NDK 中的 Clang 21 工具链
@@ -43,10 +44,10 @@ jobs:
           export ARCH=arm64
           export SUBARCH=arm64
           
-          # 打印 Clang 版本，供 Actions 日志自查
+          # 打印 Clang 版本供日志检查
           clang -v
           
-          # 让新编译器对提取的配置进行自适应自补全
+          # 自适应配置
           make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
       - name: Start Fully Compiling (Image + DTBs)
@@ -71,7 +72,7 @@ jobs:
           # 将内核 Image 与所有高通生成驱动的 dtb 硬件树硬合并拼接
           cat kernel-source/out/arch/arm64/boot/Image kernel-source/out/arch/arm64/boot/dts/vendor/qcom/*.dtb > kernel-source/out/arch/arm64/boot/Image-dtb
           
-          # 复制拼接好的完整内核到 AnyKernel 目录下，强制按 Moto Edge S 的 BoardConfig.mk 规范命名为 "kernel"
+          # 复制拼接好的完整内核到 AnyKernel 目录下，强制命名为 "kernel"
           cp kernel-source/out/arch/arm64/boot/Image-dtb AnyKernel3/kernel
           
           # 额外检查是否有 DTBO 分区文件生成，如有则一同带走
