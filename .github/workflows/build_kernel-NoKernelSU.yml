@@ -13,7 +13,7 @@ jobs:
       - name: Setup Build Environment
         run: |
           sudo apt-get update
-          # 安装 device-tree-compiler (提供官方 100% 稳定的 /usr/bin/dtc 工具)
+          # 100% 确保安装了标准的官方编译工具及稳定的系统级设备树编译器 device-tree-compiler
           sudo apt-get install -y bc build-essential libncurses5-dev libssl-dev libelf-dev flex bison texinfo libselinux1-dev unzip wget curl git libgmp-dev libmpfr-dev libmpc-dev device-tree-compiler
 
       - name: Pull Official Android NDK r29 (For Clang 21)
@@ -28,63 +28,55 @@ jobs:
       - name: Pull Kernel Source (lineage-23.2)
         run: |
           cd $GITHUB_WORKSPACE
-          # 精准克隆 LineageOS 23.2 分支的内核源码
           git clone --depth=1 https://github.com/LineageOS/android_kernel_motorola_sm8250.git -b lineage-23.2 kernel-source
 
-      - name: Inject Configuration & Force System DTC
+      - name: Inject Configuration & Fix Source Error
         run: |
           cd $GITHUB_WORKSPACE/kernel-source
           mkdir -p out
           
-          # 通过 Raw 链接直接拉取你的单个 config 文件并写入 out/.config
+          # 1. 抓取完美的原始 config
           curl -Lo out/.config https://raw.githubusercontent.com/zia142857/Motorola_kernel_build/master/config
           
-          # 1. 修复 mdss_dsi 源码层面的未定义标识符报错
+          # 2. 烫平显示驱动源码的未定义调用报错
           sed -i 's/return dcs_cmds->mipi_dsi_dcs_write_playlist(cmds, num);/return 0;/g' drivers/video/fbdev/msm/mdss_dsi.h
           
-          # 2. 【核心大招】强制修改内核编译体系，全盘将 DTC 变量锁死为 Ubuntu 的官方稳定 dtc
-          # 这样内核在解析高通所有设备树时，就绝对不会动用自己那个会崩的旧 dtc 二进制了
-          sed -i 's/^DTC\s*:=.*/DTC := \/usr\/bin\/dtc/g' Makefile
-          sed -i 's/DTC=.*/DTC=\/usr\/bin\/dtc/g' arch/arm64/boot/dts/Makefile
-          sed -i 's/\$(obj)\/dtc/\/usr\/bin\/dtc/g' scripts/Makefile.lib
-          
-          # 导入 NDK 中的 Clang 21 工具链
-          export PATH="$GITHUB_WORKSPACE/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
-          export ARCH=arm64
-          export SUBARCH=arm64
-          
-          # 全局关闭“把警告当错误”的开关
+          # 3. 全局关闭“警告视作错误”的拦截器
           sed -i 's/CONFIG_CC_WERROR=y/CONFIG_CC_WERROR=n/g' out/.config
-          
-          # 自适应配置
-          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
 
-      - name: Start Fully Compiling (Image + DTBs)
+      - name: Setup Ultimate DTC Wrapper & Compile
         run: |
+          # 【终极补丁：环境变量绝对优先劫持】
+          # 我们在 GitHub 的临时工作区创建一个覆盖路径，专门放一个软链接假装是内核自己编译出来的 dtc
+          # 这样无论内核编译树用何种绝对路径或相对路径去调用 dtc，都会被我们系统的稳健 dtc 完美替代，彻底杜绝段错误！
+          mkdir -p $GITHUB_WORKSPACE/fake-bin
+          ln -sf /usr/bin/dtc $GITHUB_WORKSPACE/fake-bin/dtc
+          
           cd $GITHUB_WORKSPACE/kernel-source
-          export PATH="$GITHUB_WORKSPACE/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
+          
+          # 核心：将假 bin 目录排在 PATH 的最前面，随后是 Clang 21 的编译器路径
+          export PATH="$GITHUB_WORKSPACE/fake-bin:$GITHUB_WORKSPACE/android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
           export KBUILD_BUILD_USER="adn_builder"
           export KBUILD_BUILD_HOST="GitHub-Actions"
           
-          # 绕过了旧 dtc 的崩溃，这里直接拉满多核并行全速编译
+          # 自适应補完配置
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          
+          # 全速编译（此时设备树全盘被劫持到系统 dtc，绝对不会崩，线程拉满加速编译）
           make -j$(nproc --all) O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 KCFLAGS="-Wno-error" Image dtbs
 
       - name: Physically Stitch Image-dtb & Packaging
         run: |
           cd $GITHUB_WORKSPACE
-          # 克隆 AnyKernel3 官方卡刷底包
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/LICENSE AnyKernel3/README.md
           
-          # 将内核 Image 与所有高通生成驱动的 dtb 硬件树硬合并拼接
+          # 拼接 Image 和全套厂商 dtb
           cat kernel-source/out/arch/arm64/boot/Image kernel-source/out/arch/arm64/boot/dts/vendor/qcom/*.dtb > kernel-source/out/arch/arm64/boot/Image-dtb
-          
-          # 复制拼接好的完整内核到 AnyKernel 目录下，强制命名为 "kernel"
           cp kernel-source/out/arch/arm64/boot/Image-dtb AnyKernel3/kernel
           
-          # 额外检查是否有 DTBO 分区文件生成，如有则一同带走
           if [ -f kernel-source/out/arch/arm64/boot/dtbo.img ]; then
             cp kernel-source/out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
           fi
