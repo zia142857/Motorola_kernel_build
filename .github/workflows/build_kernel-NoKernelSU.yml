@@ -49,6 +49,7 @@ jobs:
       SUBARCH: arm64
       # The /proc/config.gz you provided was built with Android clang r563880 / clang 21.
       CLANG_VERSION: clang-r563880
+      CLANG_BRANCH: android16-qpr1-release
       DEFCONFIG: vendor/kona-perf_defconfig
       EXTRA_CONFIGS: |
         arch/arm64/configs/vendor/ext_config/moto-kona.config
@@ -89,13 +90,24 @@ jobs:
 
       - name: Download Android clang toolchain
         run: |
-          git clone --depth=1 --filter=blob:none --sparse \
+          set -euxo pipefail
+          git clone --depth=1 -b "${CLANG_BRANCH}" --filter=blob:none --sparse \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             clang-prebuilt
           cd clang-prebuilt
-          git sparse-checkout set "${CLANG_VERSION}"
-          test -x "${CLANG_VERSION}/bin/clang"
-          "${CLANG_VERSION}/bin/clang" --version
+
+          if git cat-file -e "HEAD:${CLANG_VERSION}" 2>/dev/null; then
+            SELECTED_CLANG="${CLANG_VERSION}"
+          else
+            echo "Requested ${CLANG_VERSION} does not exist on ${CLANG_BRANCH}; falling back to clang-stable"
+            SELECTED_CLANG="clang-stable"
+          fi
+
+          git sparse-checkout set "${SELECTED_CLANG}"
+          test -x "${SELECTED_CLANG}/bin/clang"
+          "${SELECTED_CLANG}/bin/clang" --version
+          echo "CLANG_SELECTED=${SELECTED_CLANG}" >> "$GITHUB_ENV"
+          echo "CLANG_BIN=${GITHUB_WORKSPACE}/clang-prebuilt/${SELECTED_CLANG}/bin" >> "$GITHUB_ENV"
 
       - name: Optionally integrate KernelSU-Next
         if: ${{ inputs.enable_ksu == 'true' }}
@@ -121,10 +133,10 @@ jobs:
 
       - name: Prepare kernel config
         working-directory: kernel
-        env:
-          PATH: ${{ github.workspace }}/clang-prebuilt/clang-r563880/bin:${{ env.PATH }}
         run: |
           set -euxo pipefail
+          export PATH="${CLANG_BIN}:$PATH"
+          clang --version
           mkdir -p "${GITHUB_WORKSPACE}/${OUT_DIR}"
 
           MAKE_ARGS=(
@@ -171,10 +183,10 @@ jobs:
 
       - name: Build Image, DTBs, DTBOs and modules
         working-directory: kernel
-        env:
-          PATH: ${{ github.workspace }}/clang-prebuilt/clang-r563880/bin:${{ env.PATH }}
         run: |
           set -euxo pipefail
+          export PATH="${CLANG_BIN}:$PATH"
+          clang --version
           MAKE_ARGS=(
             -j"$(nproc)"
             O="${GITHUB_WORKSPACE}/${OUT_DIR}"
