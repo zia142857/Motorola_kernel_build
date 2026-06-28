@@ -212,8 +212,10 @@ jobs:
           # The in-tree host dtc can segfault when built with Android clang 21 on
           # GitHub Actions. Build host tools with system gcc/g++ instead.
           rm -f "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc"
-          make "${MAKE_ARGS[@]}" scripts_dtc
-          "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" -v || true
+          make "${MAKE_ARGS[@]}" scripts
+          if [ -x "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" ]; then
+            "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" -v || true
+          fi
 
           make "${MAKE_ARGS[@]}" Image dtbs modules
 
