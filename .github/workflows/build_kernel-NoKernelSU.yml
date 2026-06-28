@@ -1,318 +1,262 @@
-name: Build Motorola Edge S (nio) LineageOS 23.2 Kernel
+name: Build Motorola Edge S kernel
 
 on:
   workflow_dispatch:
     inputs:
-      enable_ksu:
-        description: "Integrate KernelSU-Next before building"
-        required: true
-        default: "false"
-        type: choice
-        options:
-          - "false"
-          - "true"
-      ksu_repo:
-        description: "KernelSU repository"
-        required: true
-        default: "KernelSU-Next/KernelSU-Next"
-        type: string
-      ksu_branch:
-        description: "KernelSU branch/ref"
-        required: true
-        default: "next"
-        type: string
       kernel_repo:
-        description: "Kernel source repository"
+        description: Kernel repository
         required: true
-        default: "https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
-        type: string
+        default: LineageOS/android_kernel_motorola_sm8250
       kernel_branch:
-        description: "Kernel source branch"
+        description: Kernel branch
         required: true
-        default: "lineage-23.2"
-        type: string
+        default: lineage-23.2
+      device_repo:
+        description: Device tree repository
+        required: true
+        default: LineageOS/android_device_motorola_nio
+      device_branch:
+        description: Device tree branch
+        required: true
+        default: lineage-23.2
+      common_repo:
+        description: Common device tree repository
+        required: true
+        default: LineageOS/android_device_motorola_sm8250-common
+      common_branch:
+        description: Common device tree branch
+        required: true
+        default: lineage-23.2
+      clang_branch:
+        description: Android clang branch
+        required: true
+        default: android16-release
+      clang_version:
+        description: Android clang directory to use
+        required: true
+        default: clang-r547379
 
 permissions:
   contents: read
 
+concurrency:
+  group: nio-kernel-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
-    name: Build kernel and AnyKernel3 zip
-    runs-on: ubuntu-22.04
+    name: Build Image, DTB, DTBO and modules
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
 
     env:
-      DEVICE: nio
-      KERNEL_DIR: kernel
-      OUT_DIR: out
-      ARTIFACT_DIR: artifacts
       ARCH: arm64
       SUBARCH: arm64
-      # The /proc/config.gz you provided was built with Android clang r563880 / clang 21.
-      CLANG_VERSION: clang-r563880
-      CLANG_BRANCH: android16-qpr1-release
+      KERNEL_DIR: ${{ github.workspace }}/kernel/motorola/sm8250
+      OUT_DIR: ${{ github.workspace }}/out
+      CLANG_DIR: ${{ github.workspace }}/toolchains/clang
+      CLANG_VERSION: ${{ inputs.clang_version }}
+      DEVICE_DIR: ${{ github.workspace }}/device/motorola/nio
+      COMMON_DIR: ${{ github.workspace }}/device/motorola/sm8250-common
       DEFCONFIG: vendor/kona-perf_defconfig
-      EXTRA_CONFIGS: |
-        arch/arm64/configs/vendor/ext_config/moto-kona.config
-        arch/arm64/configs/vendor/ext_config/nio-default.config
+      CONFIG_FRAGMENTS: vendor/ext_config/moto-kona.config vendor/ext_config/nio-default.config
+      MAKE_TARGETS: Image dtbs modules
 
     steps:
-      - name: Install build dependencies
+      - name: Prepare packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             bc \
             bison \
+            build-essential \
             ca-certificates \
-            cpio \
-            curl \
+            ccache \
             flex \
-            g++ \
-            gcc \
             git \
-            kmod \
             libelf-dev \
-            libncurses5-dev \
             libssl-dev \
             lld \
-            make \
-            openssl \
+            llvm \
             python3 \
-            python-is-python3 \
             rsync \
-            unzip \
             xz-utils \
-            zip \
-            zstd
+            zip
 
       - name: Clone kernel source
         run: |
-          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" "${KERNEL_DIR}"
-          cd "${KERNEL_DIR}"
-          echo "Kernel HEAD: $(git rev-parse HEAD)"
+          git clone --depth=1 \
+            --branch "${{ inputs.kernel_branch }}" \
+            "https://github.com/${{ inputs.kernel_repo }}.git" \
+            "${KERNEL_DIR}"
 
-      - name: Download Android clang toolchain
+      - name: Clone device trees
         run: |
-          set -euxo pipefail
-          git clone --depth=1 -b "${CLANG_BRANCH}" --filter=blob:none --sparse \
+          git clone --depth=1 \
+            --branch "${{ inputs.device_branch }}" \
+            "https://github.com/${{ inputs.device_repo }}.git" \
+            "${DEVICE_DIR}"
+          git clone --depth=1 \
+            --branch "${{ inputs.common_branch }}" \
+            "https://github.com/${{ inputs.common_repo }}.git" \
+            "${COMMON_DIR}"
+
+      - name: Clone Android clang
+        run: |
+          git clone --depth=1 --filter=blob:none --no-checkout \
+            --branch "${{ inputs.clang_branch }}" \
             https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            clang-prebuilt
-          cd clang-prebuilt
+            "${CLANG_DIR}"
+          git -C "${CLANG_DIR}" sparse-checkout init --cone
+          git -C "${CLANG_DIR}" sparse-checkout set "${CLANG_VERSION}"
+          git -C "${CLANG_DIR}" checkout
 
-          if git cat-file -e "HEAD:${CLANG_VERSION}" 2>/dev/null; then
-            SELECTED_CLANG="${CLANG_VERSION}"
-          else
-            echo "Requested ${CLANG_VERSION} does not exist on ${CLANG_BRANCH}; falling back to clang-stable"
-            SELECTED_CLANG="clang-stable"
+      - name: Select clang
+        run: |
+          set -euo pipefail
+          PREFERRED_CLANG="${CLANG_DIR}/${CLANG_VERSION}"
+          if [ ! -x "${PREFERRED_CLANG}/bin/clang" ]; then
+            echo "No usable Android clang found at ${PREFERRED_CLANG}" >&2
+            exit 1
           fi
+          echo "CLANG_PREBUILT=${PREFERRED_CLANG}" >> "${GITHUB_ENV}"
+          "${PREFERRED_CLANG}/bin/clang" --version
 
-          git sparse-checkout set "${SELECTED_CLANG}"
-          test -x "${SELECTED_CLANG}/bin/clang"
-          "${SELECTED_CLANG}/bin/clang" --version
-          echo "CLANG_SELECTED=${SELECTED_CLANG}" >> "$GITHUB_ENV"
-          echo "CLANG_BIN=${GITHUB_WORKSPACE}/clang-prebuilt/${SELECTED_CLANG}/bin" >> "$GITHUB_ENV"
+      - name: Validate nio kernel configuration
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          test -f "arch/arm64/configs/${DEFCONFIG}"
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            test -f "arch/arm64/configs/${fragment}"
+          done
+          grep -R "nio-default.config" "${DEVICE_DIR}/BoardConfig.mk"
+          grep -R "TARGET_KERNEL_CONFIG" "${COMMON_DIR}/BoardConfigCommon.mk"
+          grep -R "CONFIG_NIO_DTB=y" "arch/arm64/configs/vendor/ext_config/nio-default.config"
 
-      - name: Optionally integrate KernelSU-Next
-        if: ${{ inputs.enable_ksu == 'true' }}
-        working-directory: kernel
+      - name: Configure kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          export PATH="${CLANG_PREBUILT}/bin:${PATH}"
+
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            "${DEFCONFIG}"
+
+          FRAGMENT_PATHS=()
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            FRAGMENT_PATHS+=("arch/arm64/configs/${fragment}")
+          done
+          ./scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" "${OUT_DIR}/.config" "${FRAGMENT_PATHS[@]}"
+
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            olddefconfig
+
+          grep -q "CONFIG_NIO_DTB=y" "${OUT_DIR}/.config"
+          grep -q "CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y" "${OUT_DIR}/.config"
+          grep -q "CONFIG_BUILD_ARM64_DT_OVERLAY=y" "${OUT_DIR}/.config"
+
+      - name: Build kernel
+        working-directory: ${{ env.KERNEL_DIR }}
         env:
-          KSU_REPO: https://github.com/${{ inputs.ksu_repo }}.git
-          KSU_BRANCH: ${{ inputs.ksu_branch }}
+          KBUILD_BUILD_USER: lineage
+          KBUILD_BUILD_HOST: github-actions
         run: |
-          set -euxo pipefail
-          curl -LSs "https://raw.githubusercontent.com/${{ inputs.ksu_repo }}/${{ inputs.ksu_branch }}/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch }}"
+          set -euo pipefail
+          export PATH="${CLANG_PREBUILT}/bin:${PATH}"
+          unset DTC DTC_EXT
 
-          # Conservative KSU-related config fragment. Some KernelSU versions do not require
-          # all of these options, but they are generally useful for Android root solutions.
-          cat > arch/arm64/configs/vendor/ext_config/ksu-extra.config <<'EOF'
-          CONFIG_KSU=y
-          CONFIG_KPROBES=y
-          CONFIG_KPROBE_EVENTS=y
-          CONFIG_OVERLAY_FS=y
-          CONFIG_TMPFS_XATTR=y
-          CONFIG_CONFIGFS_FS=y
-          EOF
-          echo "arch/arm64/configs/vendor/ext_config/ksu-extra.config" >> "$GITHUB_WORKSPACE/extra-config-list.txt"
+          make -j"$(nproc)" O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            Image modules
 
-      - name: Prepare kernel config
-        working-directory: kernel
+          make -j1 O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            V=1 \
+            dtbs
+
+      - name: Collect artifacts
         run: |
-          set -euxo pipefail
-          export PATH="${CLANG_BIN}:$PATH"
-          clang --version
-          mkdir -p "${GITHUB_WORKSPACE}/${OUT_DIR}"
+          set -euo pipefail
+          ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifact"
+          MODULE_DIR="${ARTIFACT_DIR}/modules"
+          DTB_DIR="${ARTIFACT_DIR}/dtb"
+          DTBO_DIR="${ARTIFACT_DIR}/dtbo"
+          mkdir -p "${MODULE_DIR}" "${DTB_DIR}" "${DTBO_DIR}"
 
-          MAKE_ARGS=(
-            O="${GITHUB_WORKSPACE}/${OUT_DIR}"
-            ARCH=arm64
-            LLVM=1
-            LLVM_IAS=1
-            CLANG_TRIPLE=aarch64-linux-gnu-
-            CROSS_COMPILE=aarch64-linux-gnu-
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-            CC=clang
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-            HOSTCC=gcc
-            HOSTCXX=g++
-          )
+          IMAGE="${OUT_DIR}/arch/arm64/boot/Image"
+          test -s "${IMAGE}"
+          cp "${IMAGE}" "${ARTIFACT_DIR}/Image"
 
-          make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
+          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -type f -name "*.dtb" -print -exec cp -t "${DTB_DIR}" {} +
+          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -type f -name "*.dtbo" -print -exec cp -t "${DTBO_DIR}" {} +
+          find "${OUT_DIR}" -type f -name "*.ko" -print -exec cp -t "${MODULE_DIR}" {} +
 
-          CONFIG_LIST=(
-            arch/arm64/configs/vendor/ext_config/moto-kona.config
-            arch/arm64/configs/vendor/ext_config/nio-default.config
-          )
-          if [ -f "${GITHUB_WORKSPACE}/extra-config-list.txt" ]; then
-            while IFS= read -r cfg; do
-              [ -n "$cfg" ] && CONFIG_LIST+=("$cfg")
-            done < "${GITHUB_WORKSPACE}/extra-config-list.txt"
-          fi
+          test "$(find "${DTB_DIR}" -type f -name '*.dtb' | wc -l)" -gt 0
+          test "$(find "${DTBO_DIR}" -type f -name '*.dtbo' | wc -l)" -gt 0
+          test "$(find "${MODULE_DIR}" -type f -name '*.ko' | wc -l)" -gt 0
 
-          scripts/kconfig/merge_config.sh \
-            -O "${GITHUB_WORKSPACE}/${OUT_DIR}" \
-            "${GITHUB_WORKSPACE}/${OUT_DIR}/.config" \
-            "${CONFIG_LIST[@]}"
+          {
+            echo "Kernel source:"
+            git -C "${KERNEL_DIR}" log -1 --oneline
+            echo
+            echo "Clang:"
+            "${CLANG_PREBUILT}/bin/clang" --version | head -n1
+            echo
+            echo "Image:"
+            ls -lh "${ARTIFACT_DIR}/Image"
+            echo
+            echo "DTB count:"
+            find "${DTB_DIR}" -type f -name "*.dtb" | wc -l
+            echo
+            echo "DTBO count:"
+            find "${DTBO_DIR}" -type f -name "*.dtbo" | wc -l
+            echo
+            echo "Module count:"
+            find "${MODULE_DIR}" -type f -name "*.ko" | wc -l
+          } | tee "${ARTIFACT_DIR}/build-info.txt"
 
-          make "${MAKE_ARGS[@]}" olddefconfig
-
-          echo "===== Important final config values ====="
-          grep -E '^(CONFIG_LOCALVERSION|CONFIG_LOCALVERSION_AUTO|CONFIG_ARCH_KONA|CONFIG_NIO_DTB|CONFIG_MMI_DEVICE_DTBS|CONFIG_BUILD_ARM64_DT_OVERLAY|CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY_FS)=' \
-            "${GITHUB_WORKSPACE}/${OUT_DIR}/.config" || true
-
-      - name: Build Image, DTBs, DTBOs and modules
-        working-directory: kernel
-        run: |
-          set -euxo pipefail
-          export PATH="${CLANG_BIN}:$PATH"
-          clang --version
-          MAKE_ARGS=(
-            -j"$(nproc)"
-            O="${GITHUB_WORKSPACE}/${OUT_DIR}"
-            ARCH=arm64
-            LLVM=1
-            LLVM_IAS=1
-            CLANG_TRIPLE=aarch64-linux-gnu-
-            CROSS_COMPILE=aarch64-linux-gnu-
-            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
-            CC=clang
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-            HOSTCC=gcc
-            HOSTCXX=g++
-          )
-
-          # The in-tree host dtc can segfault when built with Android clang 21 on
-          # GitHub Actions. Build host tools with system gcc/g++ instead.
-          rm -f "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc"
-          make "${MAKE_ARGS[@]}" scripts
-          if [ -x "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" ]; then
-            "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" -v || true
-          fi
-
-          make "${MAKE_ARGS[@]}" Image dtbs modules
-
-          # Not every downstream 4.19 tree exposes a top-level dtbo.img target.
-          # Build it when available; otherwise collect raw .dtbo files below.
-          make "${MAKE_ARGS[@]}" dtbo.img || true
-
-      - name: Collect build outputs
-        run: |
-          set -euxo pipefail
-          rm -rf "${ARTIFACT_DIR}"
-          mkdir -p \
-            "${ARTIFACT_DIR}/boot" \
-            "${ARTIFACT_DIR}/dtb" \
-            "${ARTIFACT_DIR}/dtbo" \
-            "${ARTIFACT_DIR}/modules"
-
-          cp "${OUT_DIR}/arch/arm64/boot/Image" "${ARTIFACT_DIR}/boot/Image"
-
-
-          if [ -f "${OUT_DIR}/arch/arm64/boot/Image.gz" ]; then
-            cp "${OUT_DIR}/arch/arm64/boot/Image.gz" "${ARTIFACT_DIR}/boot/Image.gz"
-          fi
-
-          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -print -exec cp -v {} "${ARTIFACT_DIR}/dtb/" \;
-          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -name '*.dtbo' -print -exec cp -v {} "${ARTIFACT_DIR}/dtbo/" \;
-
-          if [ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]; then
-            cp "${OUT_DIR}/arch/arm64/boot/dtbo.img" "${ARTIFACT_DIR}/dtbo/dtbo.img"
-          elif [ -f "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom/dtbo.img" ]; then
-            cp "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom/dtbo.img" "${ARTIFACT_DIR}/dtbo/dtbo.img"
-          fi
-
-          find "${OUT_DIR}" -type f -name '*.ko' -print -exec cp -v --parents {} "${ARTIFACT_DIR}/modules/" \;
-
-          echo "===== Collected files ====="
-          find "${ARTIFACT_DIR}" -type f | sort
-
-      - name: Build AnyKernel3 flashable zip
-        run: |
-          set -euxo pipefail
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
-          cd AnyKernel3
-          rm -rf .git README.md LICENSE *placeholder 2>/dev/null || true
-
-          cp "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/boot/Image" ./Image
-
-
-          # Keep DTB/DTBO/modules in the zip for manual use/debugging. The generic
-          # AnyKernel3 script below only replaces the kernel inside the current boot image.
-          mkdir -p dtb dtbo modules
-          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/dtb/." dtb/ || true
-          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/dtbo/." dtbo/ || true
-          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/modules/." modules/ || true
-
-          cat > anykernel.sh <<'EOF'
-          # AnyKernel3 Ramdisk Mod Script
-          # osm0sis @ xda-developers
-
-          properties() { '
-          kernel.string=LineageOS 23.2 kernel for Motorola Edge S / nio
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=nio
-          device.name2=XT2125-4
-          supported.versions=
-          supported.patchlevels=
-          '; }
-
-          block=auto;
-          is_slot_device=1;
-          ramdisk_compression=auto;
-          patch_vbmeta_flag=auto;
-
-          . tools/ak3-core.sh;
-
-          dump_boot;
-          write_boot;
-          EOF
-
-          zip_name="AnyKernel3-nio-lineage23.2$( [ '${{ inputs.enable_ksu }}' = 'true' ] && echo '-ksu' || true )-${GITHUB_RUN_NUMBER}.zip"
-          zip -r9 "${GITHUB_WORKSPACE}/${zip_name}" . -x '*.git*' 'README.md' 'LICENSE'
-          echo "ZIP_NAME=${zip_name}" >> "$GITHUB_ENV"
-
-      - name: Upload raw kernel artifacts
+      - name: Upload kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nio-lineage23.2-kernel-raw-${{ github.run_number }}
-          path: artifacts
-          if-no-files-found: error
-
-      - name: Upload AnyKernel3 flashable zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_NAME }}
+          name: nio-lineage-23.2-kernel-${{ github.run_number }}
+          path: artifact
           if-no-files-found: error
