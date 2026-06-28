@@ -1,153 +1,3 @@
-name: Build Motorola Edge S kernel
-
-on:
-  workflow_dispatch:
-    inputs:
-      kernel_repo:
-        description: Kernel repository
-        required: true
-        default: LineageOS/android_kernel_motorola_sm8250
-      kernel_branch:
-        description: Kernel branch
-        required: true
-        default: lineage-23.2
-      device_repo:
-        description: Device tree repository
-        required: true
-        default: LineageOS/android_device_motorola_nio
-      device_branch:
-        description: Device tree branch
-        required: true
-        default: lineage-23.2
-      common_repo:
-        description: Common device tree repository
-        required: true
-        default: LineageOS/android_device_motorola_sm8250-common
-      common_branch:
-        description: Common device tree branch
-        required: true
-        default: lineage-23.2
-      clang_branch:
-        description: Android clang branch
-        required: true
-        default: android16-release
-      clang_version:
-        description: Android clang directory to use
-        required: true
-        default: clang-r547379
-
-permissions:
-  contents: read
-
-concurrency:
-  group: nio-kernel-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  build:
-    name: Build Image, DTB, DTBO and modules
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-
-    env:
-      ARCH: arm64
-      SUBARCH: arm64
-      KERNEL_DIR: ${{ github.workspace }}/kernel/motorola/sm8250
-      OUT_DIR: ${{ github.workspace }}/out
-      CLANG_DIR: ${{ github.workspace }}/toolchains/clang
-      CLANG_VERSION: ${{ inputs.clang_version }}
-      DEVICE_DIR: ${{ github.workspace }}/device/motorola/nio
-      COMMON_DIR: ${{ github.workspace }}/device/motorola/sm8250-common
-      DEFCONFIG: vendor/kona-perf_defconfig
-      CONFIG_FRAGMENTS: vendor/ext_config/moto-kona.config vendor/ext_config/nio-default.config
-      MAKE_TARGETS: Image dtbs modules
-
-    steps:
-      - name: Prepare packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            bc \
-            bison \
-            build-essential \
-            ca-certificates \
-            ccache \
-            flex \
-            git \
-            libelf-dev \
-            libssl-dev \
-            lld \
-            llvm \
-            python3 \
-            rsync \
-            xz-utils \
-            zip
-
-      - name: Clone kernel source
-        run: |
-          git clone --depth=1 \
-            --branch "${{ inputs.kernel_branch }}" \
-            "https://github.com/${{ inputs.kernel_repo }}.git" \
-            "${KERNEL_DIR}"
-
-      - name: Clone device trees
-        run: |
-          git clone --depth=1 \
-            --branch "${{ inputs.device_branch }}" \
-            "https://github.com/${{ inputs.device_repo }}.git" \
-            "${DEVICE_DIR}"
-          git clone --depth=1 \
-            --branch "${{ inputs.common_branch }}" \
-            "https://github.com/${{ inputs.common_repo }}.git" \
-            "${COMMON_DIR}"
-
-      - name: Clone Android clang
-        run: |
-          git clone --depth=1 --filter=blob:none --no-checkout \
-            --branch "${{ inputs.clang_branch }}" \
-            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            "${CLANG_DIR}"
-          git -C "${CLANG_DIR}" sparse-checkout init --cone
-          git -C "${CLANG_DIR}" sparse-checkout set "${CLANG_VERSION}"
-          git -C "${CLANG_DIR}" checkout
-
-      - name: Select clang
-        run: |
-          set -euo pipefail
-          PREFERRED_CLANG="${CLANG_DIR}/${CLANG_VERSION}"
-          if [ ! -x "${PREFERRED_CLANG}/bin/clang" ]; then
-            echo "No usable Android clang found at ${PREFERRED_CLANG}" >&2
-            exit 1
-          fi
-          echo "CLANG_PREBUILT=${PREFERRED_CLANG}" >> "${GITHUB_ENV}"
-          "${PREFERRED_CLANG}/bin/clang" --version
-
-      - name: Validate nio kernel configuration
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          test -f "arch/arm64/configs/${DEFCONFIG}"
-          for fragment in ${CONFIG_FRAGMENTS}; do
-            test -f "arch/arm64/configs/${fragment}"
-          done
-          grep -R "nio-default.config" "${DEVICE_DIR}/BoardConfig.mk"
-          grep -R "TARGET_KERNEL_CONFIG" "${COMMON_DIR}/BoardConfigCommon.mk"
-          grep -R "CONFIG_NIO_DTB=y" "arch/arm64/configs/vendor/ext_config/nio-default.config"
-
-      - name: Patch bundled dtc null-termination check
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          path = Path("scripts/dtc/checks.c")
-          text = path.read_text()
-          original = text
-
-          text = re.sub(
-              r'FAIL\(c,\s*"\\"%s\\"\s+property in %s is not null terminated",\s*'
               r'propname,\s*node->fullpath\);',
               'FAIL(c, dti, node, "\\"%s\\" property in %s is not null terminated",\n'
               '\t     propname, node->fullpath);',
@@ -208,14 +58,6 @@ jobs:
             STRIP=llvm-strip \
             olddefconfig
 
-          make O="${OUT_DIR}" \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            HOSTCC=clang \
-            HOSTCXX=clang++ \
-            scripts_dtc
-
           grep -q "CONFIG_NIO_DTB=y" "${OUT_DIR}/.config"
           grep -q "CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y" "${OUT_DIR}/.config"
           grep -q "CONFIG_BUILD_ARM64_DT_OVERLAY=y" "${OUT_DIR}/.config"
@@ -229,6 +71,7 @@ jobs:
           set -euo pipefail
           export PATH="${CLANG_PREBUILT}/bin:${PATH}"
           unset DTC DTC_EXT
+          rm -f "${OUT_DIR}/scripts/dtc/dtc" "${OUT_DIR}/scripts/dtc/"*.o || true
 
           make -j"$(nproc)" O="${OUT_DIR}" \
             ARCH=arm64 \
