@@ -66,6 +66,8 @@ jobs:
             cpio \
             curl \
             flex \
+            g++ \
+            gcc \
             git \
             kmod \
             libelf-dev \
@@ -154,8 +156,8 @@ jobs:
             OBJCOPY=llvm-objcopy
             OBJDUMP=llvm-objdump
             STRIP=llvm-strip
-            HOSTCC=clang
-            HOSTCXX=clang++
+            HOSTCC=gcc
+            HOSTCXX=g++
           )
 
           make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
@@ -203,9 +205,15 @@ jobs:
             OBJCOPY=llvm-objcopy
             OBJDUMP=llvm-objdump
             STRIP=llvm-strip
-            HOSTCC=clang
-            HOSTCXX=clang++
+            HOSTCC=gcc
+            HOSTCXX=g++
           )
+
+          # The in-tree host dtc can segfault when built with Android clang 21 on
+          # GitHub Actions. Build host tools with system gcc/g++ instead.
+          rm -f "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc"
+          make "${MAKE_ARGS[@]}" scripts_dtc
+          "${GITHUB_WORKSPACE}/${OUT_DIR}/scripts/dtc/dtc" -v || true
 
           make "${MAKE_ARGS[@]}" Image dtbs modules
 
