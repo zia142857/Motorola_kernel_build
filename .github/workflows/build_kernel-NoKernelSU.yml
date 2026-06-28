@@ -1,157 +1,296 @@
-name: Build moto edge s (Lineage OS 23.2 A16)
+name: Build Motorola Edge S (nio) LineageOS 23.2 Kernel
 
 on:
   workflow_dispatch:
+    inputs:
+      enable_ksu:
+        description: "Integrate KernelSU-Next before building"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      ksu_repo:
+        description: "KernelSU repository"
+        required: true
+        default: "KernelSU-Next/KernelSU-Next"
+        type: string
+      ksu_branch:
+        description: "KernelSU branch/ref"
+        required: true
+        default: "next"
+        type: string
+      kernel_repo:
+        description: "Kernel source repository"
+        required: true
+        default: "https://github.com/LineageOS/android_kernel_motorola_sm8250.git"
+        type: string
+      kernel_branch:
+        description: "Kernel source branch"
+        required: true
+        default: "lineage-23.2"
+        type: string
+
+permissions:
+  contents: read
 
 jobs:
-  build-kernel:
-    name: moto edge s (Lineage OS 23.2 A16)
-    runs-on: ubuntu-latest
+  build:
+    name: Build kernel and AnyKernel3 zip
+    runs-on: ubuntu-22.04
+
+    env:
+      DEVICE: nio
+      KERNEL_DIR: kernel
+      OUT_DIR: out
+      ARTIFACT_DIR: artifacts
+      ARCH: arm64
+      SUBARCH: arm64
+      # The /proc/config.gz you provided was built with Android clang r563880 / clang 21.
+      CLANG_VERSION: clang-r563880
+      DEFCONFIG: vendor/kona-perf_defconfig
+      EXTRA_CONFIGS: |
+        arch/arm64/configs/vendor/ext_config/moto-kona.config
+        arch/arm64/configs/vendor/ext_config/nio-default.config
 
     steps:
-      - name: ⏰ Checkout repository
-        uses: actions/checkout@v4
-
-      - name: ⌛️ Install dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            bc bison build-essential ccache curl flex \
-            git libssl-dev libelf-dev lz4 python3 \
-            zip device-tree-compiler xz-utils
+          sudo apt-get install -y --no-install-recommends \
+            bc \
+            bison \
+            ca-certificates \
+            cpio \
+            curl \
+            flex \
+            git \
+            kmod \
+            libelf-dev \
+            libncurses5-dev \
+            libssl-dev \
+            lld \
+            make \
+            openssl \
+            python3 \
+            python-is-python3 \
+            rsync \
+            unzip \
+            xz-utils \
+            zip \
+            zstd
 
-      - name: 📥 Clone kernel source
+      - name: Clone kernel source
         run: |
-          git clone --depth=1 \
-            -b lineage-23.2 \
-            https://github.com/LineageOS/android_kernel_motorola_sm8250.git \
-            device_kernel
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" "${KERNEL_DIR}"
+          cd "${KERNEL_DIR}"
+          echo "Kernel HEAD: $(git rev-parse HEAD)"
 
-      - name: 🔧 Download Clang r574158
+      - name: Download Android clang toolchain
         run: |
-          mkdir -p clang
-          curl -L "https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r574158-14475230/clang-r574158.tar.gz" | tar -xz -C clang
+          git clone --depth=1 --filter=blob:none --sparse \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            clang-prebuilt
+          cd clang-prebuilt
+          git sparse-checkout set "${CLANG_VERSION}"
+          test -x "${CLANG_VERSION}/bin/clang"
+          "${CLANG_VERSION}/bin/clang" --version
 
-      - name: 🏗️ Generate defconfig
+      - name: Optionally integrate KernelSU-Next
+        if: ${{ inputs.enable_ksu == 'true' }}
+        working-directory: kernel
+        env:
+          KSU_REPO: https://github.com/${{ inputs.ksu_repo }}.git
+          KSU_BRANCH: ${{ inputs.ksu_branch }}
         run: |
-          export PATH=$(pwd)/clang/bin:$PATH
-          cd device_kernel
+          set -euxo pipefail
+          curl -LSs "https://raw.githubusercontent.com/${{ inputs.ksu_repo }}/${{ inputs.ksu_branch }}/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch }}"
 
-          make O=out ARCH=arm64 \
-            CC=clang HOSTCC=gcc HOSTCXX=g++ \
-            LD=ld.lld LLVM=1 LLVM_IAS=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
-            vendor/kona-perf_defconfig
+          # Conservative KSU-related config fragment. Some KernelSU versions do not require
+          # all of these options, but they are generally useful for Android root solutions.
+          cat > arch/arm64/configs/vendor/ext_config/ksu-extra.config <<'EOF'
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          CONFIG_KPROBE_EVENTS=y
+          CONFIG_OVERLAY_FS=y
+          CONFIG_TMPFS_XATTR=y
+          CONFIG_CONFIGFS_FS=y
+          EOF
+          echo "arch/arm64/configs/vendor/ext_config/ksu-extra.config" >> "$GITHUB_WORKSPACE/extra-config-list.txt"
 
-          ./scripts/kconfig/merge_config.sh -O out/ -m out/.config \
-            arch/arm64/configs/vendor/ext_config/moto-kona.config \
+      - name: Prepare kernel config
+        working-directory: kernel
+        env:
+          PATH: ${{ github.workspace }}/clang-prebuilt/clang-r563880/bin:${{ env.PATH }}
+        run: |
+          set -euxo pipefail
+          mkdir -p "${GITHUB_WORKSPACE}/${OUT_DIR}"
+
+          MAKE_ARGS=(
+            O="${GITHUB_WORKSPACE}/${OUT_DIR}"
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+          )
+
+          make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
+
+          CONFIG_LIST=(
+            arch/arm64/configs/vendor/ext_config/moto-kona.config
             arch/arm64/configs/vendor/ext_config/nio-default.config
+          )
+          if [ -f "${GITHUB_WORKSPACE}/extra-config-list.txt" ]; then
+            while IFS= read -r cfg; do
+              [ -n "$cfg" ] && CONFIG_LIST+=("$cfg")
+            done < "${GITHUB_WORKSPACE}/extra-config-list.txt"
+          fi
 
-          scripts/config --file out/.config \
-            --disable CONFIG_MODULE_SIG \
-            --disable CONFIG_MODULE_SIG_FORCE \
-            --disable CONFIG_MODULE_SIG_ALL \
-            --disable CONFIG_MODVERSIONS \
-            --enable CONFIG_CFI_PERMISSIVE \
-            --set-val CONFIG_PANIC_TIMEOUT -1
+          scripts/kconfig/merge_config.sh \
+            -O "${GITHUB_WORKSPACE}/${OUT_DIR}" \
+            "${GITHUB_WORKSPACE}/${OUT_DIR}/.config" \
+            "${CONFIG_LIST[@]}"
 
-          make O=out ARCH=arm64 \
-            CC=clang HOSTCC=gcc HOSTCXX=g++ \
-            LD=ld.lld LLVM=1 LLVM_IAS=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
-            olddefconfig
+          make "${MAKE_ARGS[@]}" olddefconfig
 
-      - name: 🔍 Verify config
+          echo "===== Important final config values ====="
+          grep -E '^(CONFIG_LOCALVERSION|CONFIG_LOCALVERSION_AUTO|CONFIG_ARCH_KONA|CONFIG_NIO_DTB|CONFIG_MMI_DEVICE_DTBS|CONFIG_BUILD_ARM64_DT_OVERLAY|CONFIG_MODULES|CONFIG_MODVERSIONS|CONFIG_LTO_CLANG|CONFIG_CFI_CLANG|CONFIG_KSU|CONFIG_KPROBES|CONFIG_OVERLAY_FS)=' \
+            "${GITHUB_WORKSPACE}/${OUT_DIR}/.config" || true
+
+      - name: Build Image, DTBs, DTBOs and modules
+        working-directory: kernel
+        env:
+          PATH: ${{ github.workspace }}/clang-prebuilt/clang-r563880/bin:${{ env.PATH }}
         run: |
-          cd device_kernel
-          echo "=== LTO ===" && grep "CONFIG_LTO" out/.config
-          echo "=== CFI ===" && grep "CONFIG_CFI" out/.config
-          echo "=== MODULE_SIG ===" && grep "CONFIG_MODULE_SIG" out/.config
-          echo "=== MODVERSIONS ===" && grep "CONFIG_MODVERSIONS" out/.config
+          set -euxo pipefail
+          MAKE_ARGS=(
+            -j"$(nproc)"
+            O="${GITHUB_WORKSPACE}/${OUT_DIR}"
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            HOSTCC=clang
+            HOSTCXX=clang++
+          )
 
-      - name: 🚀 Build kernel
+          make "${MAKE_ARGS[@]}" Image dtbs modules
+
+          # Not every downstream 4.19 tree exposes a top-level dtbo.img target.
+          # Build it when available; otherwise collect raw .dtbo files below.
+          make "${MAKE_ARGS[@]}" dtbo.img || true
+
+      - name: Collect build outputs
         run: |
-          export PATH=$(pwd)/clang/bin:$PATH
-          cd device_kernel
+          set -euxo pipefail
+          rm -rf "${ARTIFACT_DIR}"
+          mkdir -p \
+            "${ARTIFACT_DIR}/boot" \
+            "${ARTIFACT_DIR}/dtb" \
+            "${ARTIFACT_DIR}/dtbo" \
+            "${ARTIFACT_DIR}/modules"
 
-          make -j$(nproc --all) O=out ARCH=arm64 \
-            CC=clang HOSTCC=gcc HOSTCXX=g++ \
-            LD=ld.lld LLVM=1 LLVM_IAS=1 \
-            CLANG_TRIPLE=aarch64-linux-gnu- \
-            DTC=/usr/bin/dtc DTC_EXT=/usr/bin/dtc \
-            KCFLAGS="-Wno-unknown-warning-option -Wno-pointer-sign -Wno-unused-but-set-variable -Wno-gnu-variable-sized-type-not-at-end -Wno-tautological-constant-out-of-range-compare" \
-            2>&1 | tee build.log
+          cp "${OUT_DIR}/arch/arm64/boot/Image" "${ARTIFACT_DIR}/boot/Image"
 
-          ls -lh out/arch/arm64/boot/Image
 
-      - name: 🌲 Collect DTBs
+          if [ -f "${OUT_DIR}/arch/arm64/boot/Image.gz" ]; then
+            cp "${OUT_DIR}/arch/arm64/boot/Image.gz" "${ARTIFACT_DIR}/boot/Image.gz"
+          fi
+
+          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -name '*.dtb' -print -exec cp -v {} "${ARTIFACT_DIR}/dtb/" \;
+          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -name '*.dtbo' -print -exec cp -v {} "${ARTIFACT_DIR}/dtbo/" \;
+
+          if [ -f "${OUT_DIR}/arch/arm64/boot/dtbo.img" ]; then
+            cp "${OUT_DIR}/arch/arm64/boot/dtbo.img" "${ARTIFACT_DIR}/dtbo/dtbo.img"
+          elif [ -f "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom/dtbo.img" ]; then
+            cp "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom/dtbo.img" "${ARTIFACT_DIR}/dtbo/dtbo.img"
+          fi
+
+          find "${OUT_DIR}" -type f -name '*.ko' -print -exec cp -v --parents {} "${ARTIFACT_DIR}/modules/" \;
+
+          echo "===== Collected files ====="
+          find "${ARTIFACT_DIR}" -type f | sort
+
+      - name: Build AnyKernel3 flashable zip
         run: |
-          cd device_kernel
-          DTB_DIR="out/arch/arm64/boot/dts/vendor/qcom"
+          set -euxo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cd AnyKernel3
+          rm -rf .git README.md LICENSE *placeholder 2>/dev/null || true
 
-          # 列出所有 DTB 文件
-          echo "=== Available DTBs ==="
-          ls $DTB_DIR/*.dtb | head -20
+          cp "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/boot/Image" ./Image
 
-          # 找到 nio 相关 DTB
-          echo "=== nio DTBs ==="
-          ls $DTB_DIR/*nio*.dtb 2>/dev/null || echo "No nio-specific DTB found"
-          ls $DTB_DIR/*kona-moto*.dtb 2>/dev/null || echo "No kona-moto DTB found"
 
-          # 合并所有 kona-moto DTB（和官方构建方式一致）
-          cat $DTB_DIR/kona-moto*.dtb > ../combined-dtb.img
-          ls -lh ../combined-dtb.img
-          echo "DTB_READY=true" >> $GITHUB_ENV
+          # Keep DTB/DTBO/modules in the zip for manual use/debugging. The generic
+          # AnyKernel3 script below only replaces the kernel inside the current boot image.
+          mkdir -p dtb dtbo modules
+          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/dtb/." dtb/ || true
+          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/dtbo/." dtbo/ || true
+          cp -a "${GITHUB_WORKSPACE}/${ARTIFACT_DIR}/modules/." modules/ || true
 
-      - name: 📦 Package boot.img
-        run: |
-          # 下载官方 boot.img
-          curl -L "https://mirrors.ocf.berkeley.edu/lineageos/full/nio/20260615/boot.img" \
-            -o boot_source.img
+          cat > anykernel.sh <<'EOF'
+          # AnyKernel3 Ramdisk Mod Script
+          # osm0sis @ xda-developers
 
-          # 下载 magiskboot
-          curl -L "https://github.com/topjohnwu/Magisk/releases/download/v28.0/Magisk-v28.0.apk" \
-            -o Magisk.apk
-          unzip -p Magisk.apk lib/x86_64/libmagiskboot.so > magiskboot
-          chmod +x magiskboot
+          properties() { '
+          kernel.string=LineageOS 23.2 kernel for Motorola Edge S / nio
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=nio
+          device.name2=XT2125-4
+          supported.versions=
+          supported.patchlevels=
+          '; }
 
-          # 解包并替换内核
-          ./magiskboot unpack boot_source.img
-          cp device_kernel/out/arch/arm64/boot/Image kernel
-          ./magiskboot repack boot_source.img new-boot.img
+          block=auto;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
 
-          ls -lh new-boot.img
+          . tools/ak3-core.sh;
 
-      - name: 📦 Package vendor_boot.img
-        run: |
-          # 下载官方 vendor_boot.img
-          curl -L "https://mirrors.ocf.berkeley.edu/lineageos/full/nio/20260615/vendor_boot.img" \
-            -o vendor_boot_source.img
+          dump_boot;
+          write_boot;
+          EOF
 
-          mkdir vendor_boot_unpack
-          cp vendor_boot_source.img vendor_boot_unpack/
-          cd vendor_boot_unpack
+          zip_name="AnyKernel3-nio-lineage23.2$( [ '${{ inputs.enable_ksu }}' = 'true' ] && echo '-ksu' || true )-${GITHUB_RUN_NUMBER}.zip"
+          zip -r9 "${GITHUB_WORKSPACE}/${zip_name}" . -x '*.git*' 'README.md' 'LICENSE'
+          echo "ZIP_NAME=${zip_name}" >> "$GITHUB_ENV"
 
-          # 解包 vendor_boot
-          ../magiskboot unpack vendor_boot_source.img
-
-          # 替换 DTB
-          cp ../combined-dtb.img dtb
-
-          # 重新打包
-          ../magiskboot repack vendor_boot_source.img new-vendor_boot.img
-
-          cp new-vendor_boot.img ../
-          cd ..
-          ls -lh new-vendor_boot.img
-
-      - name: ✏️ Upload artifacts
+      - name: Upload raw kernel artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: nio-lineage23.2-images
-          path: |
-            new-boot.img
-            new-vendor_boot.img
-            device_kernel/build.log
+          name: nio-lineage23.2-kernel-raw-${{ github.run_number }}
+          path: artifacts
+          if-no-files-found: error
+
+      - name: Upload AnyKernel3 flashable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
