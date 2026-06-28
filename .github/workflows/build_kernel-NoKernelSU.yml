@@ -134,6 +134,42 @@ jobs:
           grep -R "TARGET_KERNEL_CONFIG" "${COMMON_DIR}/BoardConfigCommon.mk"
           grep -R "CONFIG_NIO_DTB=y" "arch/arm64/configs/vendor/ext_config/nio-default.config"
 
+      - name: Patch bundled dtc null-termination check
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import re
+          from pathlib import Path
+
+          path = Path("scripts/dtc/checks.c")
+          text = path.read_text()
+          original = text
+
+          text = re.sub(
+              r'FAIL\(c,\s*"\\"%s\\"\s+property in %s is not null terminated",\s*'
+              r'propname,\s*node->fullpath\);',
+              'FAIL(c, dti, node, "\\"%s\\" property in %s is not null terminated",\n'
+              '\t     propname, node->fullpath);',
+              text,
+              count=1,
+          )
+          text = re.sub(
+              r'WARNING\(nm,\s*NULL,\s*check_is_null_terminated,\s*NULL,\s*\(propname\)\)',
+              'WARNING(nm, check_is_null_terminated, (propname), NULL)',
+              text,
+              count=1,
+          )
+
+          if text == original:
+              raise SystemExit("dtc checks.c patch did not match this source tree")
+
+          path.write_text(text)
+          PY
+
+          grep -Fq 'FAIL(c, dti, node, "\"%s\" property in %s is not null terminated"' scripts/dtc/checks.c
+          grep -Fq 'WARNING(nm, check_is_null_terminated, (propname), NULL)' scripts/dtc/checks.c
+
       - name: Configure kernel
         working-directory: ${{ env.KERNEL_DIR }}
         run: |
@@ -171,6 +207,14 @@ jobs:
             OBJDUMP=llvm-objdump \
             STRIP=llvm-strip \
             olddefconfig
+
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            HOSTCC=clang \
+            HOSTCXX=clang++ \
+            scripts_dtc
 
           grep -q "CONFIG_NIO_DTB=y" "${OUT_DIR}/.config"
           grep -q "CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y" "${OUT_DIR}/.config"
