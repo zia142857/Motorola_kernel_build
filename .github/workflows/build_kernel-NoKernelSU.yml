@@ -147,6 +147,15 @@ jobs:
           original = text
 
           text = re.sub(
+              r'static void check_is_null_terminated\(struct check \*c,\s*'
+              r'struct node \*root,\s*'
+              r'struct node \*node\)',
+              'static void check_is_null_terminated(struct check *c, struct dt_info *dti,\n'
+              '\t\t\t    struct node *node)',
+              text,
+              count=1,
+          )
+          text = re.sub(
               r'FAIL\(c,\s*"\\"%s\\"\s+property in %s is not null terminated",\s*'
               r'propname,\s*node->fullpath\);',
               'FAIL(c, dti, node, "\\"%s\\" property in %s is not null terminated",\n'
@@ -156,7 +165,13 @@ jobs:
           )
           text = re.sub(
               r'WARNING\(nm,\s*NULL,\s*check_is_null_terminated,\s*NULL,\s*\(propname\)\)',
-              'WARNING(nm, check_is_null_terminated, (propname), NULL)',
+              'WARNING(nm, check_is_null_terminated, (propname))',
+              text,
+              count=1,
+          )
+          text = re.sub(
+              r'ERROR\(nm,\s*NULL,\s*check_is_null_terminated,\s*NULL,\s*\(propname\)\)',
+              'ERROR(nm, check_is_null_terminated, (propname))',
               text,
               count=1,
           )
@@ -168,7 +183,11 @@ jobs:
           PY
 
           grep -Fq 'FAIL(c, dti, node, "\"%s\" property in %s is not null terminated"' scripts/dtc/checks.c
-          grep -Fq 'WARNING(nm, check_is_null_terminated, (propname), NULL)' scripts/dtc/checks.c
+          grep -Fq 'static void check_is_null_terminated(struct check *c, struct dt_info *dti,' scripts/dtc/checks.c
+          grep -Fq 'WARNING(nm, check_is_null_terminated, (propname))' scripts/dtc/checks.c
+          grep -Fq 'ERROR(nm, check_is_null_terminated, (propname))' scripts/dtc/checks.c
+          ! grep -Fq 'WARNING(nm, NULL, check_is_null_terminated' scripts/dtc/checks.c
+          ! grep -Fq 'ERROR(nm, NULL, check_is_null_terminated' scripts/dtc/checks.c
 
       - name: Configure kernel
         working-directory: ${{ env.KERNEL_DIR }}
