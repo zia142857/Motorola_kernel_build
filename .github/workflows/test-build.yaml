@@ -1,4 +1,4 @@
-name: Build Motorola Edge S kernel
+name: Build Motorola Edge S Image
 
 on:
   workflow_dispatch:
@@ -9,22 +9,6 @@ on:
         default: LineageOS/android_kernel_motorola_sm8250
       kernel_branch:
         description: Kernel branch
-        required: true
-        default: lineage-23.2
-      device_repo:
-        description: Device tree repository
-        required: true
-        default: LineageOS/android_device_motorola_nio
-      device_branch:
-        description: Device tree branch
-        required: true
-        default: lineage-23.2
-      common_repo:
-        description: Common device tree repository
-        required: true
-        default: LineageOS/android_device_motorola_sm8250-common
-      common_branch:
-        description: Common device tree branch
         required: true
         default: lineage-23.2
       clang_branch:
@@ -45,7 +29,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build AnyKernel3 flashable kernel zip
+    name: Build AnyKernel3 zip
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -57,11 +41,8 @@ jobs:
       CLANG_DIR: ${{ github.workspace }}/toolchains/clang
       CLANG_VERSION: ${{ inputs.clang_version }}
       ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
-      DEVICE_DIR: ${{ github.workspace }}/device/motorola/nio
-      COMMON_DIR: ${{ github.workspace }}/device/motorola/sm8250-common
       DEFCONFIG: vendor/kona-perf_defconfig
       CONFIG_FRAGMENTS: vendor/ext_config/moto-kona.config vendor/ext_config/nio-default.config
-      MAKE_TARGETS: Image dtbs modules
 
     steps:
       - name: Prepare packages
@@ -72,17 +53,11 @@ jobs:
             bison \
             build-essential \
             ca-certificates \
-            ccache \
-            curl \
             flex \
             git \
             libelf-dev \
             libssl-dev \
-            lld \
-            llvm \
             python3 \
-            rsync \
-            xz-utils \
             zip
 
       - name: Clone kernel source
@@ -91,17 +66,6 @@ jobs:
             --branch "${{ inputs.kernel_branch }}" \
             "https://github.com/${{ inputs.kernel_repo }}.git" \
             "${KERNEL_DIR}"
-
-      - name: Clone device trees
-        run: |
-          git clone --depth=1 \
-            --branch "${{ inputs.device_branch }}" \
-            "https://github.com/${{ inputs.device_repo }}.git" \
-            "${DEVICE_DIR}"
-          git clone --depth=1 \
-            --branch "${{ inputs.common_branch }}" \
-            "https://github.com/${{ inputs.common_repo }}.git" \
-            "${COMMON_DIR}"
 
       - name: Clone Android clang
         run: |
@@ -113,223 +77,65 @@ jobs:
           git -C "${CLANG_DIR}" sparse-checkout set "${CLANG_VERSION}"
           git -C "${CLANG_DIR}" checkout
 
-      - name: Select clang
-        run: |
-          set -euo pipefail
-          PREFERRED_CLANG="${CLANG_DIR}/${CLANG_VERSION}"
-          if [ ! -x "${PREFERRED_CLANG}/bin/clang" ]; then
-            echo "No usable Android clang found at ${PREFERRED_CLANG}" >&2
-            exit 1
-          fi
-          echo "CLANG_PREBUILT=${PREFERRED_CLANG}" >> "${GITHUB_ENV}"
-          "${PREFERRED_CLANG}/bin/clang" --version
-
-      - name: Validate nio kernel configuration
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          test -f "arch/arm64/configs/${DEFCONFIG}"
-          for fragment in ${CONFIG_FRAGMENTS}; do
-            test -f "arch/arm64/configs/${fragment}"
-          done
-          grep -R "nio-default.config" "${DEVICE_DIR}/BoardConfig.mk"
-          grep -R "TARGET_KERNEL_CONFIG" "${COMMON_DIR}/BoardConfigCommon.mk"
-          grep -R "CONFIG_NIO_DTB=y" "arch/arm64/configs/vendor/ext_config/nio-default.config"
-
-      - name: Patch bundled dtc null-termination check
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import re
-          from pathlib import Path
-
-          path = Path("scripts/dtc/checks.c")
-          text = path.read_text()
-          original = text
-
-          text = re.sub(
-              r'static void check_is_null_terminated\(struct check \*c,\s*'
-              r'struct node \*root,\s*'
-              r'struct node \*node\)',
-              'static void check_is_null_terminated(struct check *c, struct dt_info *dti,\n'
-              '\t\t\t    struct node *node)',
-              text,
-              count=1,
-          )
-          text = re.sub(
-              r'FAIL\(c,\s*"\\"%s\\"\s+property in %s is not null terminated",\s*'
-              r'propname,\s*node->fullpath\);',
-              'FAIL(c, dti, node, "\\"%s\\" property in %s is not null terminated",\n'
-              '\t     propname, node->fullpath);',
-              text,
-              count=1,
-          )
-          text = re.sub(
-              r'WARNING\(nm,\s*NULL,\s*check_is_null_terminated,\s*NULL,\s*\(propname\)\)',
-              'WARNING(nm, check_is_null_terminated, (propname))',
-              text,
-              count=1,
-          )
-          text = re.sub(
-              r'ERROR\(nm,\s*NULL,\s*check_is_null_terminated,\s*NULL,\s*\(propname\)\)',
-              'ERROR(nm, check_is_null_terminated, (propname))',
-              text,
-              count=1,
-          )
-
-          if text == original:
-              raise SystemExit("dtc checks.c patch did not match this source tree")
-
-          path.write_text(text)
-          PY
-
-          grep -Fq 'FAIL(c, dti, node, "\"%s\" property in %s is not null terminated"' scripts/dtc/checks.c
-          grep -Fq 'static void check_is_null_terminated(struct check *c, struct dt_info *dti,' scripts/dtc/checks.c
-          grep -Fq 'WARNING(nm, check_is_null_terminated, (propname))' scripts/dtc/checks.c
-          grep -Fq 'ERROR(nm, check_is_null_terminated, (propname))' scripts/dtc/checks.c
-          ! grep -Fq 'WARNING(nm, NULL, check_is_null_terminated' scripts/dtc/checks.c
-          ! grep -Fq 'ERROR(nm, NULL, check_is_null_terminated' scripts/dtc/checks.c
-
-      - name: Configure kernel
-        working-directory: ${{ env.KERNEL_DIR }}
-        run: |
-          set -euo pipefail
-          export PATH="${CLANG_PREBUILT}/bin:${PATH}"
-
-          make O="${OUT_DIR}" \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            "${DEFCONFIG}"
-
-          FRAGMENT_PATHS=()
-          for fragment in ${CONFIG_FRAGMENTS}; do
-            FRAGMENT_PATHS+=("arch/arm64/configs/${fragment}")
-          done
-          ./scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" "${OUT_DIR}/.config" "${FRAGMENT_PATHS[@]}"
-
-          make O="${OUT_DIR}" \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            olddefconfig
-
-          grep -q "CONFIG_NIO_DTB=y" "${OUT_DIR}/.config"
-          grep -q "CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y" "${OUT_DIR}/.config"
-          grep -q "CONFIG_BUILD_ARM64_DT_OVERLAY=y" "${OUT_DIR}/.config"
-
-      - name: Build kernel
+      - name: Build Image
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           KBUILD_BUILD_USER: lineage
           KBUILD_BUILD_HOST: github-actions
         run: |
           set -euo pipefail
+
+          CLANG_PREBUILT="${CLANG_DIR}/${CLANG_VERSION}"
+          test -x "${CLANG_PREBUILT}/bin/clang"
           export PATH="${CLANG_PREBUILT}/bin:${PATH}"
-          unset DTC DTC_EXT
-          rm -f "${OUT_DIR}/scripts/dtc/dtc" "${OUT_DIR}/scripts/dtc/"*.o || true
 
-          make -j"$(nproc)" O="${OUT_DIR}" \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            Image modules
+          test -f "arch/arm64/configs/${DEFCONFIG}"
+          FRAGMENT_PATHS=()
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            test -f "arch/arm64/configs/${fragment}"
+            FRAGMENT_PATHS+=("arch/arm64/configs/${fragment}")
+          done
 
-          make -j1 O="${OUT_DIR}" \
-            ARCH=arm64 \
-            LLVM=1 \
-            LLVM_IAS=1 \
-            CC=clang \
-            LD=ld.lld \
-            AR=llvm-ar \
-            NM=llvm-nm \
-            OBJCOPY=llvm-objcopy \
-            OBJDUMP=llvm-objdump \
-            STRIP=llvm-strip \
-            V=1 \
-            dtbs
+          MAKE_ARGS=(
+            O="${OUT_DIR}"
+            ARCH=arm64
+            LLVM=1
+            LLVM_IAS=1
+            CC=clang
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+          )
 
-      - name: Collect artifacts
-        run: |
-          set -euo pipefail
-          ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifact"
-          MODULE_DIR="${ARTIFACT_DIR}/modules"
-          DTB_DIR="${ARTIFACT_DIR}/dtb"
-          DTBO_DIR="${ARTIFACT_DIR}/dtbo"
-          mkdir -p "${MODULE_DIR}" "${DTB_DIR}" "${DTBO_DIR}"
+          make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
+          ./scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" "${OUT_DIR}/.config" "${FRAGMENT_PATHS[@]}"
+          make "${MAKE_ARGS[@]}" olddefconfig
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image
 
-          IMAGE="${OUT_DIR}/arch/arm64/boot/Image"
-          test -s "${IMAGE}"
-          cp "${IMAGE}" "${ARTIFACT_DIR}/Image"
+          test -s "${OUT_DIR}/arch/arm64/boot/Image"
 
-          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -type f -name "*.dtb" -print -exec cp -t "${DTB_DIR}" {} +
-          find "${OUT_DIR}/arch/arm64/boot/dts/vendor/qcom" -type f -name "*.dtbo" -print -exec cp -t "${DTBO_DIR}" {} +
-          find "${OUT_DIR}" -type f -name "*.ko" -print -exec cp -t "${MODULE_DIR}" {} +
-
-          test "$(find "${DTB_DIR}" -type f -name '*.dtb' | wc -l)" -gt 0
-          test "$(find "${DTBO_DIR}" -type f -name '*.dtbo' | wc -l)" -gt 0
-          test "$(find "${MODULE_DIR}" -type f -name '*.ko' | wc -l)" -gt 0
-
-          {
-            echo "Kernel source:"
-            git -C "${KERNEL_DIR}" log -1 --oneline
-            echo
-            echo "Clang:"
-            "${CLANG_PREBUILT}/bin/clang" --version | head -n1
-            echo
-            echo "Image:"
-            ls -lh "${ARTIFACT_DIR}/Image"
-            echo
-            echo "DTB count:"
-            find "${DTB_DIR}" -type f -name "*.dtb" | wc -l
-            echo
-            echo "DTBO count:"
-            find "${DTBO_DIR}" -type f -name "*.dtbo" | wc -l
-            echo
-            echo "Module count:"
-            find "${MODULE_DIR}" -type f -name "*.ko" | wc -l
-          } | tee "${ARTIFACT_DIR}/build-info.txt"
-
-      - name: Package AnyKernel3 flashable zip
+      - name: Package AnyKernel3 zip
         run: |
           set -euo pipefail
 
           ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifact"
+          ZIP_NAME="AnyKernel3-nio-${GITHUB_RUN_NUMBER}.zip"
           BUILT_IMAGE="${OUT_DIR}/arch/arm64/boot/Image"
-          ZIP_NAME="AnyKernel3-nio-lineage-23.2-${GITHUB_RUN_NUMBER}.zip"
 
+          mkdir -p "${ARTIFACT_DIR}"
           test -s "${BUILT_IMAGE}"
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "${ANYKERNEL_DIR}"
 
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "${ANYKERNEL_DIR}"
           cp "${BUILT_IMAGE}" "${ANYKERNEL_DIR}/Image"
           cat > "${ANYKERNEL_DIR}/anykernel.sh" <<'EOF'
           ### AnyKernel3 Ramdisk Mod Script
           ## osm0sis @ xda-developers
 
           properties() { '
-          kernel.string=LineageOS 23.2 nio kernel
+          kernel.string=Motorola Edge S nio kernel
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -366,11 +172,9 @@ jobs:
           zip -r9 "${ARTIFACT_DIR}/${ZIP_NAME}" .
           test -s "${ARTIFACT_DIR}/${ZIP_NAME}"
 
-      - name: Upload kernel artifacts
+      - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
-          name: AnyKernel3-nio-lineage-23.2-${{ github.run_number }}
-          path: |
-            artifact/AnyKernel3-nio-lineage-23.2-*.zip
-            artifact/build-info.txt
+          name: AnyKernel3-nio-${{ github.run_number }}
+          path: artifact/AnyKernel3-nio-*.zip
           if-no-files-found: error
