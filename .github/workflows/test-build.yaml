@@ -1,4 +1,4 @@
-name: Build Motorola Edge S Image
+name: Build Motorola Edge S KernelSU Next kernel
 
 on:
   workflow_dispatch:
@@ -19,17 +19,25 @@ on:
         description: Android clang directory to use
         required: true
         default: clang-r547379
+      ksu_repo:
+        description: KernelSU Next repository
+        required: true
+        default: KernelSU-Next/KernelSU-Next
+      ksu_ref:
+        description: KernelSU Next ref for non-GKI kernels
+        required: true
+        default: legacy
 
 permissions:
   contents: read
 
 concurrency:
-  group: nio-kernel-${{ github.ref }}
+  group: nio-ksunext-kernel-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build AnyKernel3 zip
+    name: Build KernelSU Next AnyKernel3 zip
     runs-on: ubuntu-24.04
     timeout-minutes: 120
 
@@ -77,65 +85,132 @@ jobs:
           git -C "${CLANG_DIR}" sparse-checkout set "${CLANG_VERSION}"
           git -C "${CLANG_DIR}" checkout
 
-      - name: Build Image
+      - name: Select clang
+        run: |
+          set -euo pipefail
+          PREFERRED_CLANG="${CLANG_DIR}/${CLANG_VERSION}"
+          if [ ! -x "${PREFERRED_CLANG}/bin/clang" ]; then
+            echo "No usable Android clang found at ${PREFERRED_CLANG}" >&2
+            exit 1
+          fi
+          echo "CLANG_PREBUILT=${PREFERRED_CLANG}" >> "${GITHUB_ENV}"
+          "${PREFERRED_CLANG}/bin/clang" --version
+
+      - name: Integrate KernelSU Next
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          git clone "https://github.com/${{ inputs.ksu_repo }}.git" KernelSU-Next
+          git -C KernelSU-Next checkout "${{ inputs.ksu_ref }}"
+
+          ln -sfn ../KernelSU-Next/kernel drivers/kernelsu
+          grep -q 'obj-$(CONFIG_KSU) += kernelsu/' drivers/Makefile || \
+            printf '\nobj-$(CONFIG_KSU) += kernelsu/\n' >> drivers/Makefile
+          grep -q 'source "drivers/kernelsu/Kconfig"' drivers/Kconfig || \
+            sed -i '/endmenu/i\source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+
+          test -f drivers/kernelsu/Kconfig
+          git -C KernelSU-Next rev-parse --short HEAD
+
+      - name: Configure kernel
+        working-directory: ${{ env.KERNEL_DIR }}
+        run: |
+          set -euo pipefail
+          export PATH="${CLANG_PREBUILT}/bin:${PATH}"
+
+          test -f "arch/arm64/configs/${DEFCONFIG}"
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            test -f "arch/arm64/configs/${fragment}"
+          done
+
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            "${DEFCONFIG}"
+
+          cat > "${OUT_DIR}/ksunext.config" <<'EOF'
+          CONFIG_OVERLAY_FS=y
+          CONFIG_KSU=y
+          CONFIG_KPROBES=y
+          EOF
+          sed -i 's/^          //' "${OUT_DIR}/ksunext.config"
+
+          FRAGMENT_PATHS=()
+          for fragment in ${CONFIG_FRAGMENTS}; do
+            FRAGMENT_PATHS+=("arch/arm64/configs/${fragment}")
+          done
+          ./scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" \
+            "${OUT_DIR}/.config" \
+            "${FRAGMENT_PATHS[@]}" \
+            "${OUT_DIR}/ksunext.config"
+
+          make O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            olddefconfig
+
+          grep -q "CONFIG_BUILD_ARM64_UNCOMPRESSED_KERNEL=y" "${OUT_DIR}/.config"
+          grep -q "CONFIG_OVERLAY_FS=y" "${OUT_DIR}/.config"
+          grep -q "CONFIG_KSU=y" "${OUT_DIR}/.config"
+          grep -q "CONFIG_KPROBES=y" "${OUT_DIR}/.config"
+
+      - name: Build kernel Image
         working-directory: ${{ env.KERNEL_DIR }}
         env:
           KBUILD_BUILD_USER: lineage
           KBUILD_BUILD_HOST: github-actions
         run: |
           set -euo pipefail
-
-          CLANG_PREBUILT="${CLANG_DIR}/${CLANG_VERSION}"
-          test -x "${CLANG_PREBUILT}/bin/clang"
           export PATH="${CLANG_PREBUILT}/bin:${PATH}"
 
-          test -f "arch/arm64/configs/${DEFCONFIG}"
-          FRAGMENT_PATHS=()
-          for fragment in ${CONFIG_FRAGMENTS}; do
-            test -f "arch/arm64/configs/${fragment}"
-            FRAGMENT_PATHS+=("arch/arm64/configs/${fragment}")
-          done
+          make -j"$(nproc)" O="${OUT_DIR}" \
+            ARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CC=clang \
+            LD=ld.lld \
+            AR=llvm-ar \
+            NM=llvm-nm \
+            OBJCOPY=llvm-objcopy \
+            OBJDUMP=llvm-objdump \
+            STRIP=llvm-strip \
+            Image
 
-          MAKE_ARGS=(
-            O="${OUT_DIR}"
-            ARCH=arm64
-            LLVM=1
-            LLVM_IAS=1
-            CC=clang
-            LD=ld.lld
-            AR=llvm-ar
-            NM=llvm-nm
-            OBJCOPY=llvm-objcopy
-            OBJDUMP=llvm-objdump
-            STRIP=llvm-strip
-          )
-
-          make "${MAKE_ARGS[@]}" "${DEFCONFIG}"
-          ./scripts/kconfig/merge_config.sh -m -O "${OUT_DIR}" "${OUT_DIR}/.config" "${FRAGMENT_PATHS[@]}"
-          make "${MAKE_ARGS[@]}" olddefconfig
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image
-
-          test -s "${OUT_DIR}/arch/arm64/boot/Image"
-
-      - name: Package AnyKernel3 zip
+      - name: Package AnyKernel3 flashable zip
         run: |
           set -euo pipefail
 
           ARTIFACT_DIR="${GITHUB_WORKSPACE}/artifact"
-          ZIP_NAME="AnyKernel3-nio-${GITHUB_RUN_NUMBER}.zip"
           BUILT_IMAGE="${OUT_DIR}/arch/arm64/boot/Image"
-
+          ZIP_NAME="AnyKernel3-nio-lineage-23.2-ksunext-${GITHUB_RUN_NUMBER}.zip"
           mkdir -p "${ARTIFACT_DIR}"
-          test -s "${BUILT_IMAGE}"
 
+          test -s "${BUILT_IMAGE}"
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git "${ANYKERNEL_DIR}"
           cp "${BUILT_IMAGE}" "${ANYKERNEL_DIR}/Image"
+
           cat > "${ANYKERNEL_DIR}/anykernel.sh" <<'EOF'
           ### AnyKernel3 Ramdisk Mod Script
           ## osm0sis @ xda-developers
 
           properties() { '
-          kernel.string=Motorola Edge S nio kernel
+          kernel.string=LineageOS 23.2 nio KernelSU Next kernel
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -164,6 +239,24 @@ jobs:
           flash_boot;
           EOF
 
+          {
+            echo "Kernel source:"
+            git -C "${KERNEL_DIR}" log -1 --oneline
+            echo
+            echo "KernelSU Next source:"
+            git -C "${KERNEL_DIR}/KernelSU-Next" describe --tags --always --dirty
+            git -C "${KERNEL_DIR}/KernelSU-Next" log -1 --oneline
+            echo
+            echo "Clang:"
+            "${CLANG_PREBUILT}/bin/clang" --version | head -n1
+            echo
+            echo "Enabled config:"
+            grep -E "CONFIG_OVERLAY_FS=|CONFIG_KSU=|CONFIG_KPROBES=|CONFIG_HAVE_KPROBES=|CONFIG_KPROBE_EVENTS=" "${OUT_DIR}/.config" || true
+            echo
+            echo "Image:"
+            ls -lh "${BUILT_IMAGE}"
+          } | tee "${ARTIFACT_DIR}/build-info.txt"
+
           rm -rf "${ANYKERNEL_DIR}/.git" "${ANYKERNEL_DIR}/.github"
           rm -f "${ANYKERNEL_DIR}/README.md" "${ANYKERNEL_DIR}/LICENSE"
           find "${ANYKERNEL_DIR}" -type f -name placeholder -delete
@@ -175,6 +268,8 @@ jobs:
       - name: Upload AnyKernel3 zip
         uses: actions/upload-artifact@v4
         with:
-          name: AnyKernel3-nio-${{ github.run_number }}
-          path: artifact/AnyKernel3-nio-*.zip
+          name: AnyKernel3-nio-lineage-23.2-ksunext-${{ github.run_number }}
+          path: |
+            artifact/AnyKernel3-nio-lineage-23.2-ksunext-*.zip
+            artifact/build-info.txt
           if-no-files-found: error
